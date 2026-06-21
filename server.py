@@ -24,8 +24,8 @@ def get_github_headers():
         "X-GitHub-Api-Version": "2022-11-28"
     }
 
-def fetch_from_github(file_path: str, default_structure: dict) -> tuple[dict, str | None]:
-    """Helper to fetch a file's structured content and its current SHA hash from GitHub."""
+def fetch_from_github(file_path: str, default_structure: dict) -> tuple[dict, str | None, int]:
+    """Helper to fetch a file's structured content, its current SHA hash, and HTTP status code from GitHub."""
     url = f"https://api.github.com/repos/{REPO_NAME}/contents/{file_path}"
     
     with httpx.Client() as client:
@@ -33,16 +33,19 @@ def fetch_from_github(file_path: str, default_structure: dict) -> tuple[dict, st
         
         if response.status_code == 200:
             file_data = response.json()
-            # Decode base64 content from GitHub
-            content_str = base64.b64decode(file_data["content"]).decode("utf-8")
-            return json.loads(content_str), file_data["sha"]
+            content_str = base64.b64decode(file_data["content"]).decode("utf-8").strip()
+            if not content_str:
+                return default_structure, file_data["sha"], response.status_code
+            try:
+                return json.loads(content_str), file_data["sha"], response.status_code
+            except json.JSONDecodeError:
+                return default_structure, file_data["sha"], response.status_code
         elif response.status_code == 404:
-            # File doesn't exist yet, return the default template structure
-            return default_structure, None
+            return default_structure, None, response.status_code
         else:
             raise Exception(f"GitHub API Error ({response.status_code}): {response.text}")
 
-def save_to_github(file_path: str, data: dict, sha: str | None) -> bool:
+def save_to_github(file_path: str, data: dict, sha: str | None) -> tuple[bool, int]:
     """Helper to push base64-encoded JSON updates back to the private GitHub repo."""
     url = f"https://api.github.com/repos/{REPO_NAME}/contents/{file_path}"
     
@@ -58,7 +61,7 @@ def save_to_github(file_path: str, data: dict, sha: str | None) -> bool:
 
     with httpx.Client() as client:
         res = client.put(url, headers=get_github_headers(), json=payload)
-        return res.status_code in [200, 201]
+        return res.status_code in [200, 201], res.status_code
 
 
 # =====================================================================
@@ -92,8 +95,14 @@ def read_profile() -> str:
         }
     }
     try:
-        profile_data, _ = fetch_from_github("persona_profile.json", default_profile)
-        return json.dumps(profile_data, indent=4)
+        profile_data, sha, status_code = fetch_from_github("persona_profile.json", default_profile)
+        if status_code == 404:
+            success, create_status = save_to_github("persona_profile.json", profile_data, None)
+            if success:
+                return f"[GitHub GET {status_code}, PUT {create_status}] Created persona_profile.json with defaults.\n{json.dumps(profile_data, indent=4)}"
+            else:
+                return f"[GitHub GET {status_code}, PUT {create_status}] File not found and failed to create it."
+        return f"[GitHub GET {status_code}]\n{json.dumps(profile_data, indent=4)}"
     except Exception as e:
         return f"Error reading profile: {str(e)}"
 
@@ -114,7 +123,7 @@ def patch_profile(category: str, key_or_event: str, value: str = None) -> str:
     }
     
     try:
-        profile_data, sha = fetch_from_github("persona_profile.json", default_profile)
+        profile_data, sha, fetch_status = fetch_from_github("persona_profile.json", default_profile)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         if category == "health_log":
@@ -126,8 +135,12 @@ def patch_profile(category: str, key_or_event: str, value: str = None) -> str:
         else:
             return f"Error: Invalid category '{category}'. Must be 'core', 'health_log', or 'hobbies'."
 
-        success = save_to_github("persona_profile.json", profile_data, sha)
-        return "Successfully updated profile context on GitHub." if success else "Failed to save profile changes to GitHub."
+        success, save_status = save_to_github("persona_profile.json", profile_data, sha)
+        created = " (created new file)" if sha is None else ""
+        if success:
+            return f"[GitHub GET {fetch_status}, PUT {save_status}] Successfully updated profile context on GitHub.{created}"
+        else:
+            return f"[GitHub GET {fetch_status}, PUT {save_status}] Failed to save profile changes to GitHub.{created}"
         
     except Exception as e:
         return f"Error patching profile: {str(e)}"
